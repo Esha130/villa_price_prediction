@@ -1,153 +1,132 @@
 import pandas as pd
+import streamlit as st
+from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import RandomForestRegressor
 from xgboost import XGBRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-from sklearn.preprocessing import LabelEncoder
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-# Preprocessing function
+# Label Encoding Function
+def label_encode_columns(dataframe, columns, label_encoders=None):
+    if label_encoders is None:
+        label_encoders = {}  # Initialize label encoders dictionary if not passed
+    for col in columns:
+        le = LabelEncoder()
+        # Fit and transform for training data
+        dataframe[col] = le.fit_transform(dataframe[col].astype(str))
+        label_encoders[col] = le  # Store the encoder
+    return dataframe, label_encoders
+
+# Train Models
+def train_models(data):
+    feature_columns = [col for col in data.columns if col != 'price']
+    X = data[feature_columns]
+    y = data['price']
+    X = X.apply(pd.to_numeric, errors='coerce')  # Ensure numeric
+
+    rf_model = RandomForestRegressor()
+    rf_model.fit(X, y)
+
+    xgb_model = XGBRegressor()
+    xgb_model.fit(X, y)
+
+    sarima_model = SARIMAX(y, order=(1, 1, 1), seasonal_order=(1, 1, 1, 12))
+    sarima_model = sarima_model.fit(disp=False)
+
+    return rf_model, xgb_model, sarima_model, feature_columns
+
+# Preprocess Data
 def preprocess_data(result, availability):
-    # Convert date columns to datetime format
-    result['date'] = pd.to_datetime(result['date'], errors='coerce')
-    if 'reservation_date' in result.columns:
-        result['reservation_date'] = pd.to_datetime(result['reservation_date'], errors='coerce')
-    availability['date'] = pd.to_datetime(availability['date'], errors='coerce')
+    # Convert 'check_in' and 'check_out' to datetime, if they are not already
+    result['check_in'] = pd.to_datetime(result['check_in'], errors='coerce')
+    result['check_out'] = pd.to_datetime(result['check_out'], errors='coerce')
 
-    # Drop rows with invalid dates
-    result = result.dropna(subset=['date'])
-    availability = availability.dropna(subset=['date'])
+    # Fill missing check-in/check-out values with a placeholder for categorical variables
+    result['check_in'] = result['check_in'].fillna('Unknown')
+    result['check_out'] = result['check_out'].fillna('Unknown')
 
-    # Calculate derived features
-    result['days_since_checkin'] = (result['date'] - pd.to_datetime('2024-01-01')).dt.days
-    if 'reservation_date' in result.columns:
-        result['days_since_reservation'] = (result['reservation_date'] - pd.to_datetime('2024-01-01')).dt.days
+    # Handle missing numeric values (bedroom_count, ratings, etc.)
+    result['bedroom_count'] = result['bedroom_count'].fillna(result['bedroom_count'].median())
+    result['ratings'] = result['ratings'].fillna(result['ratings'].mean())
+    result['amount'] = result['amount'].fillna(result['amount'].mean())
 
-    # Drop unnecessary columns
-    drop_columns = ['net_base_price', 'reservation_date']
-    result = result.drop(columns=[col for col in drop_columns if col in result.columns], errors='ignore')
+    # Handle categorical columns like 'villa' and 'city'
+    categorical_columns = ['villa', 'SEASONS', 'city']
+    result, label_encoders = label_encode_columns(result, categorical_columns)
 
-    # Label encode 'villa' and 'SEASONS' columns
-    for col in ['villa', 'SEASONS']:
-        if col in result.columns:
-            le = LabelEncoder()
-            result[col] = le.fit_transform(result[col])
+    # Return all three values
+    return result, availability, label_encoders  
 
-    # Ensure only numeric columns are used
-    result = result.select_dtypes(include=['number'])
-
-    # Drop rows with missing values in key features
-    result = result.dropna()
-
-    return result, availability
-
-# Predict price based on selected date
-def predict_price_for_date(date, rf_model, xgb_model, availability_data, data):
-    # Filter availability data for the selected date
+# Modify predict function for unseen labels
+def predict_price_for_date(date, rf_model, xgb_model, sarima_model, villa_data, availability_data, feature_columns, label_encoders):
     selected_date = pd.to_datetime(date).date()
     availability_data['date_only'] = availability_data['date'].dt.date
-    available_villas = availability_data[availability_data['date_only'] == selected_date].copy()
-
-    # Remove duplicate villas
-    available_villas = available_villas.drop_duplicates(subset=['villa'])
-
-    print(f"\nFiltered available villas for {selected_date}:")
-    print(available_villas)
+    available_villas = availability_data[availability_data['date_only'] == selected_date]
 
     if available_villas.empty:
-        print("No available villas found for the selected date.")
+        st.write(f"No available villas found for {selected_date}.")
         return pd.DataFrame()
 
-    # Ensure villa columns match in type
-    data['villa'] = data['villa'].astype(str)
-    available_villas['villa'] = available_villas['villa'].astype(str)
+    # Convert 'villa' and 'city' in available_villas to int using Label Encoding
+    # Use transform instead of fit_transform to ensure we use the same encoder learned on training data
+    available_villas['villa'] = label_encoders['villa'].transform(available_villas['villa'].astype(str))
+    available_villas['city'] = label_encoders['city'].transform(available_villas['city'].astype(str))
 
-    # Prepare data for prediction
-    X = data.drop(columns=['price'])
+    # Prepare input data for predictions
+    X = villa_data[feature_columns].copy()
+    X = X.apply(pd.to_numeric, errors='coerce')
+
+    # Predict prices using models
     predicted_prices_rf = rf_model.predict(X)
     predicted_prices_xgb = xgb_model.predict(X)
+    predicted_prices_sarima = sarima_model.predict(start=len(villa_data), end=len(villa_data), dynamic=False)
 
-    # Create a results dataframe with predictions
     results = pd.DataFrame({
-        'villa': data['villa'],  # Include 'villa' for merging
+        'villa': villa_data['villa'],
         'predicted_rf_listing_price': predicted_prices_rf,
         'predicted_xgb_listing_price': predicted_prices_xgb,
+        'predicted_sarima_listing_price': predicted_prices_sarima
     })
 
-    # Merge results with available villas
+    # Merge with available villas for selected date
     results = results.merge(available_villas[['villa', 'status']], on='villa', how='inner')
+    results['is_available'] = results['status'].apply(lambda x: "Yes" if x == "available" else "No")
 
-    # Add availability status
-    if 'status' in results.columns:
-        results['is_available'] = results['status'].apply(lambda x: "Yes" if x == "available" else "No")
-    else:
-        results['is_available'] = "Unknown"
+    # Reverse Label Encoding for villa and city columns to display original names
+    results['villa'] = label_encoders['villa'].inverse_transform(results['villa'])
+    results['city'] = label_encoders['city'].inverse_transform(results['city'])
 
-    # Debugging: Show merged results
-    print("\nMerged results with availability:")
-    print(results.head())
-
-    # Filter only available villas
     available_villas_results = results[results['is_available'] == "Yes"]
-
     return available_villas_results
 
-# Train Random Forest and XGBoost models
-def train_models(data):
-    # Split features and target
-    X = data.drop(columns=['price'])
-    y = data['price']
-
-    # Split into train and test sets
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    # Train Random Forest model
-    rf_model = RandomForestRegressor(random_state=42)
-    rf_model.fit(X_train, y_train)
-    rf_predictions = rf_model.predict(X_test)
-
-    # Train XGBoost model
-    xgb_model = XGBRegressor(random_state=42)
-    xgb_model.fit(X_train, y_train)
-    xgb_predictions = xgb_model.predict(X_test)
-
-    # Evaluate models
-    print("Random Forest Performance:")
-    print(f"Mean Squared Error: {mean_squared_error(y_test, rf_predictions)}")
-    print(f"Mean Absolute Error: {mean_absolute_error(y_test, rf_predictions)}\n")
-
-    print("XGBoost Performance:")
-    print(f"Mean Squared Error: {mean_squared_error(y_test, xgb_predictions)}")
-    print(f"Mean Absolute Error: {mean_absolute_error(y_test, xgb_predictions)}")
-
-    return rf_model, xgb_model
-
-# Main Streamlit app
+# Streamlit App
 def main():
-    import streamlit as st
-
     st.title("Villa Price Prediction")
 
-    # Load the data
-    file = "official_dataset.xlsx"  # Replace with the correct file path
+    # Load data
+    file = "official_dataset.xlsx"  # Replace with correct file path
     result = pd.read_excel(file, sheet_name='result')
     availability = pd.read_excel(file, sheet_name='availability')
 
     # Preprocess data
-    data, availability_data = preprocess_data(result, availability)
+    villa_data, availability_data, label_encoders = preprocess_data(result, availability)
 
     # Train models
-    rf_model, xgb_model = train_models(data)
+    rf_model, xgb_model, sarima_model, feature_columns = train_models(villa_data)
 
-    # Date selection
+    # User input for city, villa name, and date
+    selected_city = st.selectbox("Select a city", villa_data['city'].unique())
+    selected_villa = st.selectbox("Select a villa", villa_data[villa_data['city'] == selected_city]['villa'].unique())
     selected_date = st.date_input("Select a date", min_value=pd.to_datetime('2024-12-01'), max_value=pd.to_datetime('2024-12-31'))
     selected_date_str = pd.to_datetime(selected_date).strftime('%Y-%m-%d')
 
-    # Predict and display prices for the selected date
-    predicted_prices = predict_price_for_date(selected_date_str, rf_model, xgb_model, availability_data, data)
+    # Predict and display prices
+    predicted_prices = predict_price_for_date(
+        selected_date_str, rf_model, xgb_model, sarima_model, villa_data, availability_data, feature_columns, label_encoders
+    )
 
     if not predicted_prices.empty:
         st.write(f"Predicted prices for villas on {selected_date_str}:")
-        st.dataframe(predicted_prices)
+        st.dataframe(predicted_prices[['villa', 'predicted_rf_listing_price', 'predicted_xgb_listing_price', 'predicted_sarima_listing_price']])
     else:
         st.write(f"No villas are available on {selected_date_str}.")
 
